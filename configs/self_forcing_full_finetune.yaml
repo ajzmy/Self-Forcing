@@ -1,0 +1,118 @@
+# configs/self_forcing_full_finetune.yaml
+
+# ================= 路径配置 =================
+# 【重要】确保这是绝对路径，用于 base.py 加载初始权重
+teacher_checkpoint_path: /data/datasets/guiyuwei/zhoumingyue/projects/Self-Forcing/checkpoints/self_forcing_dmd.pt
+# 原始配置中用于 resume 的字段，这里设为 null 或注释掉，因为我们用 teacher_checkpoint_path 初始化
+# generator_ckpt: ... 
+
+# ================= 训练模式 =================
+trainer: score_distillation
+distribution_loss: dmd
+mixed_precision: true
+gradient_checkpointing: true
+# 【补回】显存分片策略
+sharding_strategy: hybrid_full
+
+# ================= 模型配置 =================
+real_name: Wan2.1-T2V-1.3B
+fake_name: Wan2.1-T2V-1.3B
+# 【补回】模型 FSDP 策略
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+
+# ================= 损失与指导 =================
+denoising_loss_type: flow
+# 【关键修复】指导比例，缺了这个会报错
+guidance_scale: 3.0 
+# (可选显式指定)
+# real_guidance_scale: 3.0
+# fake_guidance_scale: 0.0
+
+# ================= 步数与调度 =================
+denoising_step_list:
+  - 1000
+  - 750
+  - 500
+  - 250
+# 根据 list 中没有 0，这里应为 true
+warp_denoising_step: true 
+ts_schedule: false
+num_train_timestep: 600
+timestep_shift: 5.0
+model_kwargs:
+  timestep_shift: 5.0
+
+# ================= 优化器参数 =================
+seed: 0
+lr: 2.0e-06
+lr_critic: 4.0e-07
+# 【补回】
+discriminator_lr_multiplier: 1.0 
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+weight_decay: 0.01
+
+# ================= 数据与 Batch =================
+data_path: prompts/vidprom_filtered_extended.txt
+batch_size: 1
+total_batch_size: 64
+load_raw_video: false
+
+image_or_video_shape:
+  - 1
+  - 21
+  - 16
+  - 60
+  - 104
+
+# ================= 训练流程控制 =================
+ema_weight: 0.99
+ema_start_step: 200
+dfake_gen_update_ratio: 5
+max_steps: 1000
+resume_step: 0
+# 【补回】
+ckpt_step: 0 
+
+log_iters: 50
+gc_interval: 100
+
+# ================= Prompt =================
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+# ================= 视频结构与推理逻辑 =================
+num_frame_per_block: 3
+num_training_frames: 21
+same_step_across_blocks: true
+independent_first_frame: false
+last_step_only: false
+i2v: false
+context_noise: 0
+causal: true
+backward_simulation: true 
+
+# 你的全量微调特殊逻辑开关
+first_block_full_steps: true 
+
+# ================= 验证/评估参数 (防止缺 Key 报错) =================
+# 【补回】以下参数在 trainer 初始化或 logging 时可能会用到
+prompt_name: MovieGenVideoBench
+prompt_path: prompts/MovieGenVideoBench.txt
+eval_first_n: 64
+num_samples: 1
+height: 480
+width: 832
+num_frames: 81
+
+# ================= WandB =================
+wandb_project: Self-Forcing-Full
+# 占位符，如果 disable_wandb=true 则不会用到
+wandb_host: WANDB_HOST
+wandb_key: WANDB_KEY
+wandb_entity: WANDB_ENTITY
+disable_wandb: true

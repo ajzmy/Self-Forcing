@@ -141,38 +141,24 @@ class SelfForcingTrainingPipeline:
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
-            # Step 3.1: Spatial denoising loop
-            for index, current_timestep in enumerate(self.denoising_step_list):
+            # 根据block_index决定去噪策略
+            if block_index == 0:
+                # 对于第一个block，使用原始的随机退出机制
                 if self.same_step_across_blocks:
-                    exit_flag = (index == exit_flags[0])
+                    exit_index_for_this_block = exit_flags[0]
                 else:
-                    exit_flag = (index == exit_flags[block_index])  # Only backprop at the randomly selected timestep (consistent across all ranks)
-                timestep = torch.ones(
-                    [batch_size, current_num_frames],
-                    device=noise.device,
-                    dtype=torch.int64) * current_timestep
+                    exit_index_for_this_block = exit_flags[block_index]
 
-                if not exit_flag:
-                    with torch.no_grad():
-                        _, denoised_pred = self.generator(
-                            noisy_image_or_video=noisy_input,
-                            conditional_dict=conditional_dict,
-                            timestep=timestep,
-                            kv_cache=self.kv_cache1,
-                            crossattn_cache=self.crossattn_cache,
-                            current_start=current_start_frame * self.frame_seq_length
-                        )
-                        next_timestep = self.denoising_step_list[index + 1]
-                        noisy_input = self.scheduler.add_noise(
-                            denoised_pred.flatten(0, 1),
-                            torch.randn_like(denoised_pred.flatten(0, 1)),
-                            next_timestep * torch.ones(
-                                [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
-                        ).unflatten(0, denoised_pred.shape[:2])
-                else:
-                    # for getting real output
-                    # with torch.set_grad_enabled(current_start_frame >= start_gradient_frame_index):
-                    if current_start_frame < start_gradient_frame_index:
+                # Step 3.1: Spatial denoising loop
+                for index, current_timestep in enumerate(self.denoising_step_list):
+                    exit_flag = (index == exit_index_for_this_block)
+             
+                    timestep = torch.ones(
+                        [batch_size, current_num_frames],
+                        device=noise.device,
+                        dtype=torch.int64) * current_timestep
+
+                    if not exit_flag:
                         with torch.no_grad():
                             _, denoised_pred = self.generator(
                                 noisy_image_or_video=noisy_input,
@@ -182,7 +168,47 @@ class SelfForcingTrainingPipeline:
                                 crossattn_cache=self.crossattn_cache,
                                 current_start=current_start_frame * self.frame_seq_length
                             )
+                            next_timestep = self.denoising_step_list[index + 1]
+                            noisy_input = self.scheduler.add_noise(
+                                denoised_pred.flatten(0, 1),
+                                torch.randn_like(denoised_pred.flatten(0, 1)),
+                                next_timestep * torch.ones(
+                                    [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
+                            ).unflatten(0, denoised_pred.shape[:2])
                     else:
+                        # for getting real output
+                        # with torch.set_grad_enabled(current_start_frame >= start_gradient_frame_index):
+                        if current_start_frame < start_gradient_frame_index:
+                            with torch.no_grad():
+                                _, denoised_pred = self.generator(
+                                    noisy_image_or_video=noisy_input,
+                                    conditional_dict=conditional_dict,
+                                    timestep=timestep,
+                                    kv_cache=self.kv_cache1,
+                                    crossattn_cache=self.crossattn_cache,
+                                    current_start=current_start_frame * self.frame_seq_length
+                                )
+                        else:
+                            _, denoised_pred = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=conditional_dict,
+                                timestep=timestep,
+                                kv_cache=self.kv_cache1,
+                                crossattn_cache=self.crossattn_cache,
+                                current_start=current_start_frame * self.frame_seq_length
+                            )
+                        break
+            else:
+                # 对于后续的blocks，固定只执行第一步
+                # 获取去噪过程的第一个时间步
+                first_timestep = self.denoising_step_list[0]
+                timestep = torch.ones(
+                    [batch_size, current_num_frames],
+                    device=noise.device,
+                    dtype=torch.int64) * first_timestep
+                # 直接用初始噪声和第一个时间步进行一次前向传播，并计算梯度
+                if current_start_frame < start_gradient_frame_index:
+                    with torch.no_grad():
                         _, denoised_pred = self.generator(
                             noisy_image_or_video=noisy_input,
                             conditional_dict=conditional_dict,
@@ -191,7 +217,15 @@ class SelfForcingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=current_start_frame * self.frame_seq_length
                         )
-                    break
+                else:
+                    _, denoised_pred = self.generator(
+                        noisy_image_or_video=noisy_input,
+                        conditional_dict=conditional_dict,
+                        timestep=timestep,
+                        kv_cache=self.kv_cache1,
+                        crossattn_cache=self.crossattn_cache,
+                        current_start=current_start_frame * self.frame_seq_length
+                    )
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
@@ -219,7 +253,7 @@ class SelfForcingTrainingPipeline:
             current_start_frame += current_num_frames
 
         # Step 3.5: Return the denoised timestep
-        if not self.same_step_across_blocks:
+        """ if not self.same_step_across_blocks:
             denoised_timestep_from, denoised_timestep_to = None, None
         elif exit_flags[0] == len(self.denoising_step_list) - 1:
             denoised_timestep_to = 0
@@ -229,8 +263,9 @@ class SelfForcingTrainingPipeline:
             denoised_timestep_to = 1000 - torch.argmin(
                 (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0] + 1].cuda()).abs(), dim=0).item()
             denoised_timestep_from = 1000 - torch.argmin(
-                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0).item()
-
+                (self.scheduler.timesteps.cuda() - self.denoising_step_list[exit_flags[0]].cuda()).abs(), dim=0).item() """
+        denoised_timestep_from, denoised_timestep_to = None, None
+        
         if return_sim_step:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
 

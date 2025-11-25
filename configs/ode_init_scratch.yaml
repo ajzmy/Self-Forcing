@@ -1,0 +1,34 @@
+# --- 文件: configs/ode_init_scratch.yaml ---
+trainer: ode
+config_name: ode_init_scratch
+
+# 数据路径
+data_path: ./ode_dataset_lmdb 
+
+# !!! 补上缺失的随机种子 !!!
+seed: 0
+
+# 日志路径
+logdir: logs/ode_init_scratch
+
+# 训练参数
+batch_size: 1
+lr: 2.0e-05
+max_steps: 10000 
+denoising_step_list: [1000, 750, 500, 250] # 4步
+num_frame_per_block: 3
+
+# 显存优化
+mixed_precision: true
+gradient_checkpointing: true
+text_encoder_cpu_offload: true 
+
+# 分布式设置
+generator_fsdp_wrap_strategy: size 
+sharding_strategy: hybrid_full
+
+# 补上 Wandb 参数防止报错 (或者在运行命令里加 --disable-wandb)
+wandb_host: ""
+wandb_key: ""
+wandb_project: "ode_init"
+wandb_entity: ""

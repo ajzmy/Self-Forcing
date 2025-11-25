@@ -43,7 +43,7 @@ class ODERegression(BaseModel):
         # Step 2: Initialize all hyperparameters
         self.timestep_shift = getattr(args, "timestep_shift", 1.0)
 
-    def _initialize_models(self, args):
+    """ def _initialize_models(self, args):
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
         self.generator.model.requires_grad_(True)
 
@@ -51,7 +51,7 @@ class ODERegression(BaseModel):
         self.text_encoder.requires_grad_(False)
 
         self.vae = WanVAEWrapper()
-        self.vae.requires_grad_(False)
+        self.vae.requires_grad_(False) """
 
     @torch.no_grad()
     def _prepare_generator_input(self, ode_latent: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -136,3 +136,68 @@ class ODERegression(BaseModel):
         }
 
         return loss, log_dict
+
+
+    def generator_loss_mixed_steps(self, ode_latent: torch.Tensor, conditional_dict: dict) -> Tuple[torch.Tensor, dict]:
+        """
+        混合步数训练 Loss (修正版):
+        Block 0: 从 4 步中随机选一步作为输入 (t=1000, 750, 500, 250)，预测 GT。
+        Block >0: 强制从纯噪声(t=1000) 作为输入，预测 GT。
+        
+        关键修正：所有情况下的 Target 都是 ode_latent[:, -1] (Clean Data / Ground Truth)。
+        """
+        batch_size, num_steps, num_frames, num_channels, height, width = ode_latent.shape
+        num_frame_per_block = self.num_frame_per_block # 通常是 3
+
+        # 1. 区分 Block 0 和 其他 Block
+        block_indices = torch.arange(num_frames, device=self.device) // num_frame_per_block
+        is_first_block = (block_indices == 0)
+
+        # 2. 构造输入时间步 (Input Indices)
+        # -----------------------------------------------------------
+        # Block 0: 随机选中间状态 [0, num_steps-2]
+        # (即从 Noisy 到 倒数第二步 之间选一个作为输入)
+        t_indices_first = torch.randint(0, num_steps - 1, (batch_size,), device=self.device)
+        
+        # Block >0: 强制选初始噪声 (Index 0, T=1000)
+        t_indices_rest = torch.zeros(batch_size, dtype=torch.long, device=self.device)
+
+        # 组合 indices
+        t_indices = torch.zeros((batch_size, num_frames), dtype=torch.long, device=self.device)
+        for b in range(batch_size):
+            t_indices[b, is_first_block] = t_indices_first[b]
+            t_indices[b, ~is_first_block] = t_indices_rest[b]
+
+        # 3. 构造 Target (修正：始终是 Ground Truth)
+        # -----------------------------------------------------------
+        # 无论是第一块还是后面块，无论是哪一步，目标都是预测干净的视频
+        # ode_latent 的最后一个维度 (-1) 存放的是 Ground Truth (T=0)
+        target_latent = ode_latent[:, -1] 
+
+        # 4. 根据 Index 取出 Input Tensor
+        # -----------------------------------------------------------
+        gather_shape = (batch_size, 1, num_frames, 1, 1, 1)
+        expand_shape = (-1, -1, -1, num_channels, height, width)
+
+        # 取 Input (Noisy Latent)
+        gather_idx_in = t_indices.view(*gather_shape).expand(*expand_shape)
+        noisy_input = torch.gather(ode_latent, 1, gather_idx_in).squeeze(1)
+
+        # 获取对应的 Timestep 值 (用于 Conditioning)
+        timestep_val = self.denoising_step_list[t_indices].to(self.device)
+
+        # 5. 前向计算 Loss
+        # -----------------------------------------------------------
+        # 模型输入噪声，输出预测的 Clean Latent (pred_output)
+        _, pred_output = self.generator(
+            noisy_image_or_video=noisy_input,
+            conditional_dict=conditional_dict,
+            timestep=timestep_val
+        )
+
+        # 计算预测值与真实值 (GT) 的 MSE Loss
+        loss = F.mse_loss(pred_output, target_latent, reduction="mean")
+        
+        return loss, {"loss": loss.detach()}
+
+    

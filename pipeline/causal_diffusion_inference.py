@@ -1,6 +1,10 @@
 from tqdm import tqdm
 from typing import List, Optional
 import torch
+import os
+from torchvision.utils import save_image
+from torchvision.io import write_video
+from einops import rearrange
 
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
@@ -14,7 +18,8 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
             device,
             generator=None,
             text_encoder=None,
-            vae=None
+            vae=None,
+            visualization_path=None  # 改，新增参数
     ):
         super().__init__()
         # Step 1: Initialize all models
@@ -40,6 +45,13 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+
+        #改
+        self.visualization_path = visualization_path
+        if self.visualization_path is not None:
+            os.makedirs(self.visualization_path, exist_ok=True)
+            print(f"Intermediate visualization steps will be saved to: {self.visualization_path}")
+
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -187,14 +199,17 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+        
+        #改
+        for block_idx, current_num_frames in enumerate(all_num_frames):
             noisy_input = noise[
                 :, cache_start_frame - num_input_frames:cache_start_frame + current_num_frames - num_input_frames]
             latents = noisy_input
 
             # Step 3.1: Spatial denoising loop
             sample_scheduler = self._initialize_sample_scheduler(noise)
-            for _, t in enumerate(tqdm(sample_scheduler.timesteps)):
+            #改
+            for step_idx, t in enumerate(tqdm(sample_scheduler.timesteps)):
                 latent_model_input = latents
                 timestep = t * torch.ones(
                     [batch_size, current_num_frames], device=noise.device, dtype=torch.float32
@@ -228,6 +243,24 @@ class CausalDiffusionInferencePipeline(torch.nn.Module):
                     latents,
                     return_dict=False)[0]
                 latents = temp_x0
+
+                #改，保存中间可视化结果
+                if self.visualization_path is not None:
+                    if step_idx % 5 == 0 or step_idx == len(sample_scheduler.timesteps) - 1:
+                        with torch.no_grad():
+                            video_step=self.vae.decode_to_pixel(latents.clone())
+                            video_step = (video_step * 0.5 + 0.5).clamp(0, 1)
+                            video_step_cpu = rearrange(video_step, 'b t c h w -> b t h w c').cpu()
+                            video_to_save = (video_step_cpu * 255.0).to(torch.uint8)
+                            for sample_idx in range(video_to_save.shape[0]):
+                                filename = os.path.join(
+                                    self.visualization_path,
+                                    f'block_{block_idx}_sample_{sample_idx}_step_{step_idx:03d}.mp4'
+                                )
+                                write_video(filename, video_to_save[sample_idx], fps=8)
+
+
+
                 print(f"kv_cache['local_end_index']: {self.kv_cache_pos[0]['local_end_index']}")
                 print(f"kv_cache['global_end_index']: {self.kv_cache_pos[0]['global_end_index']}")
 

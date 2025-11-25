@@ -57,7 +57,8 @@ class Trainer:
 
         # Step 2: Initialize the model and optimizer
 
-        assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
+        
+        #assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
         self.model = ODERegression(config, device=self.device)
 
         self.model.generator = fsdp_wrap(
@@ -147,10 +148,17 @@ class Trainer:
                 text_prompts=text_prompts)
 
         # Step 3: Train the generator
-        generator_loss, log_dict = self.model.generator_loss(
+        """ generator_loss, log_dict = self.model.generator_loss(
             ode_latent=ode_latent,
             conditional_dict=conditional_dict
         )
+ """
+        # === 修改：调用 mixed_steps loss ===
+        generator_loss, log_dict = self.model.generator_loss_mixed_steps(
+            ode_latent=ode_latent,
+            conditional_dict=conditional_dict
+        )
+        # ====================================
 
         unnormalized_loss = log_dict["unnormalized_loss"]
         timestep = log_dict["timestep"]

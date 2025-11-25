@@ -1,4 +1,4 @@
-generator_ckpt: checkpoints/ode_init.pt
+generator_ckpt: /home/zhoumingyue/projects/Self-Forcing/checkpoints/self_forcing_dmd.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -23,16 +23,18 @@ wandb_entity: WANDB_ENTITY
 wandb_project: WANDB_PROJECT
 sharding_strategy: hybrid_full
 lr: 2.0e-06
-lr_critic: 2.0e-06
+#lr: 1.0e-6
+lr_critic: 4.0e-07
+#lr_critic: 2.0e-7
+
 beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
-weight_decay: 0.0
 data_path: prompts/vidprom_filtered_extended.txt
 batch_size: 1
-sid_alpha: 1.0
 ema_weight: 0.99
+#ema_start_step: 200
 ema_start_step: 200
 total_batch_size: 64
 log_iters: 50
@@ -51,3 +53,5 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
+resume_step: 950
+max_steps: 30000

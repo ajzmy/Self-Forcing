@@ -1,5 +1,8 @@
 from typing import List, Optional
 import torch
+import os
+from torchvision.io import write_video
+from einops import rearrange
 
 from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
@@ -13,7 +16,8 @@ class CausalInferencePipeline(torch.nn.Module):
             device,
             generator=None,
             text_encoder=None,
-            vae=None
+            vae=None,
+            visualization_path=None # 新增参数
     ):
         super().__init__()
         # Step 1: Initialize all models
@@ -38,6 +42,13 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+
+        self.visualization_path = visualization_path
+        if self.visualization_path is not None:
+            os.makedirs(self.visualization_path, exist_ok=True)
+            print(f"Intermediate visualization steps will be saved to: {self.visualization_path}")
+
+
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -177,15 +188,43 @@ class CausalInferencePipeline(torch.nn.Module):
         all_num_frames = [self.num_frame_per_block] * num_blocks
         if self.independent_first_frame and initial_latent is None:
             all_num_frames = [1] + all_num_frames
-        for current_num_frames in all_num_frames:
+        for block_idx, current_num_frames in enumerate(all_num_frames):
             if profile:
                 block_start.record()
 
             noisy_input = noise[
                 :, current_start_frame - num_input_frames:current_start_frame + current_num_frames - num_input_frames]
 
+            # --- 新增代码：在这里保存初始噪声 ---
+            if self.visualization_path is not None:
+                with torch.no_grad():
+                    # 我们用一个特殊的step_id, 比如-1, 来标记这是初始噪声
+                    step_id_for_noise = -1 
+                    video_step = self.vae.decode_to_pixel(noisy_input.clone())
+                    video_step = (video_step * 0.5 + 0.5).clamp(0, 1)
+                    video_step_cpu = rearrange(video_step, 'b t c h w -> b t h w c').cpu()
+                    video_to_save = (video_step_cpu * 255.0).to(torch.uint8)
+                    for sample_idx in range(video_to_save.shape[0]):
+                        # 文件名格式要和其他步骤保持一致
+                        filename = os.path.join(
+                            self.visualization_path,
+                            f'block_{block_idx}_sample_{sample_idx}_step_{step_id_for_noise:03d}.mp4'
+                        )
+                        write_video(filename, video_to_save[sample_idx], fps=8)
+            # --- 新增代码结束 ---
+
             # Step 3.1: Spatial denoising loop
-            for index, current_timestep in enumerate(self.denoising_step_list):
+
+            if block_idx==0:
+                current_denoising_steps=self.denoising_step_list
+            else:
+                current_denoising_steps=self.denoising_step_list[0:1]  # remove the first and last step for subsequent blocks
+
+
+
+    
+            #for index, current_timestep in enumerate(self.denoising_step_list):
+            for index, current_timestep in enumerate(current_denoising_steps):
                 print(f"current_timestep: {current_timestep}")
                 # set current timestep
                 timestep = torch.ones(
@@ -202,6 +241,19 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+
+                    # 保存去噪预测结果
+                    if self.visualization_path is not None:
+                        with torch.no_grad():
+                            video_step = self.vae.decode_to_pixel(denoised_pred.clone())
+                            video_step = (video_step * 0.5 + 0.5).clamp(0, 1)
+                            video_step_cpu = rearrange(video_step, 'b t c h w -> b t h w c').cpu()
+                            video_to_save = (video_step_cpu * 255.0).to(torch.uint8)
+                            for sample_idx in range(video_to_save.shape[0]):
+                                filename = os.path.join(self.visualization_path, f'block_{block_idx}_sample_{sample_idx}_step_{index:03d}.mp4')
+                                write_video(filename, video_to_save[sample_idx], fps=8)
+
+                
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -209,6 +261,21 @@ class CausalInferencePipeline(torch.nn.Module):
                         next_timestep * torch.ones(
                             [batch_size * current_num_frames], device=noise.device, dtype=torch.long)
                     ).unflatten(0, denoised_pred.shape[:2])
+                
+                    # --- 新增代码块：保存“再加噪”的结果 ---
+                    if self.visualization_path is not None:
+                        with torch.no_grad():
+                            video_step = self.vae.decode_to_pixel(noisy_input.clone())
+                            video_step = (video_step * 0.5 + 0.5).clamp(0, 1)
+                            video_step_cpu = rearrange(video_step, 'b t c h w -> b t h w c').cpu()
+                            video_to_save = (video_step_cpu * 255.0).to(torch.uint8)
+                            for sample_idx in range(video_to_save.shape[0]):
+                                # 使用新的文件名后缀来区分
+                                filename = os.path.join(self.visualization_path, f'block_{block_idx}_sample_{sample_idx}_step_{index:03d}_renoised.mp4')
+                                write_video(filename, video_to_save[sample_idx], fps=8)
+                    # --- 新增代码块结束 ---
+                
+                
                 else:
                     # for getting real output
                     _, denoised_pred = self.generator(
@@ -219,6 +286,17 @@ class CausalInferencePipeline(torch.nn.Module):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length
                     )
+                    # 保存最终的去噪结果
+                    if self.visualization_path is not None:
+                        with torch.no_grad():
+                            video_step = self.vae.decode_to_pixel(denoised_pred.clone())
+                            video_step = (video_step * 0.5 + 0.5).clamp(0, 1)
+                            video_step_cpu = rearrange(video_step, 'b t c h w -> b t h w c').cpu()
+                            video_to_save = (video_step_cpu * 255.0).to(torch.uint8)
+                            for sample_idx in range(video_to_save.shape[0]):
+                                filename = os.path.join(self.visualization_path, f'block_{block_idx}_sample_{sample_idx}_step_{index:03d}.mp4')
+                                write_video(filename, video_to_save[sample_idx], fps=8)
+
 
             # Step 3.2: record the model's output
             output[:, current_start_frame:current_start_frame + current_num_frames] = denoised_pred
@@ -242,6 +320,22 @@ class CausalInferencePipeline(torch.nn.Module):
 
             # Step 3.4: update the start and end frame indices
             current_start_frame += current_num_frames
+
+            # --- 新增诊断代码 ---
+            if self.kv_cache1 is not None and len(self.kv_cache1) > 0:
+                print(f"--- End of Block {block_idx} ---")
+                global_idx = self.kv_cache1[0]["global_end_index"].item()
+                local_idx = self.kv_cache1[0]["local_end_index"].item()
+                print(f"KV Cache Index Status: Global={global_idx}, Local={local_idx}")
+
+                # 【实验性修复】强制让 local_end_index 与 global_end_index 同步
+                # 这是一个强硬的手段，用来测试这是否是问题所在
+                # if local_idx != global_idx:
+                #     print(f"Forcing local_end_index to sync with global_end_index.")
+                #     for block in self.kv_cache1:
+                #         block["local_end_index"] = block["global_end_index"].clone()
+
+            # --- 诊断代码结束 ---
 
         if profile:
             # End diffusion timing and synchronize CUDA

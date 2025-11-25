@@ -1,5 +1,52 @@
-__pycache__
+# --- 原有的保持不变 ---
+__pycache__/
 *.egg-info
+wan_models/
+checkpoints/
 
+# 1. 忽略虚拟环境
+my_env/
+venv/
+env/
+.env
+
+# 2. 忽略所有压缩包
+*.zip
+*.tar
+*.tar.gz
+*.rar
+
+# 3. 忽略散落在各处的模型权重
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# 4. 忽略IDE配置和系统文件
+.vscode/
+.idea/
+.DS_Store
+
+# 5. 忽略缓存和日志
+*.pyc
+logs/
+my_outputs/
+videos/
+
+# --- 忽略数据集文件夹 ---
+ode_dataset_lmdb/
+ode_dataset_self_forcing/
+ode_dataset_self_forcing
+
+# --- 再次强调忽略这两个 ---
 wan_models
 checkpoints
+
+# --- 忽略日志 ---
+training_log*.txt
+
+# --- 忽略刚才生成的脚本 ---
+export_reqs.py
+
+# --- 忽略那个 139MB 的大文件 ---
+prompts/vidprom_filtered_extended.txt

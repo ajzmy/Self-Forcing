@@ -24,17 +24,82 @@ class BaseModel(nn.Module):
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
-        self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
-        self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+        
+        # 内部辅助函数
+        def load_weights_to_model(wrapper, ckpt_path):
+            if not ckpt_path: return
+            print(f"Loading weights from {ckpt_path} ...")
+            try:
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+                
+                # 1. 提取权重字典
+                if "generator" in state_dict:
+                    weights = state_dict["generator"]
+                elif "model" in state_dict:
+                    weights = state_dict["model"]
+                elif "generator_ema" in state_dict:
+                    weights = state_dict["generator_ema"]
+                else:
+                    weights = state_dict
+                
+                # 2. 智能处理 'model.' 前缀
+                # 检查权重里的 Key 是否以 'model.' 开头
+                has_model_prefix = any(k.startswith("model.") for k in weights.keys())
+                
+                if has_model_prefix:
+                    # 情况A: 权重有 'model.' 前缀 (例如 model.blocks.0.weight)
+                    # 我们直接加载到 wrapper (它有 .model 属性，刚好匹配)
+                    print("Detected 'model.' prefix in checkpoint, loading to wrapper...")
+                    missing, unexpected = wrapper.load_state_dict(weights, strict=False)
+                else:
+                    # 情况B: 权重无 'model.' 前缀 (例如 blocks.0.weight)
+                    # 我们加载到 wrapper.model
+                    print("No 'model.' prefix detected, loading to wrapper.model...")
+                    missing, unexpected = wrapper.model.load_state_dict(weights, strict=False)
 
+                print(f"Loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+                
+                # 如果仍然有大量缺失，打印出来警告用户
+                if len(missing) > 0:
+                    print(f"Sample missing keys: {missing[:5]}")
+                if len(unexpected) > 0:
+                    print(f"Sample unexpected keys: {unexpected[:5]}")
+
+            except Exception as e:
+                print(f"Error loading weights: {e}")
+        # 获取 teacher_checkpoint_path
+        sf_ckpt = getattr(args, "teacher_checkpoint_path", None)
+
+        print("Initializing Student (Generator)...")
         self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+        # 加载初始权重
+        load_weights_to_model(self.generator, sf_ckpt)
+        # 全量微调：开启梯度
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
-        self.real_score.model.requires_grad_(False)
+        if getattr(args, "trainer", "") == "score_distillation":
+            if not sf_ckpt:
+                raise ValueError("【错误】DMD 模式下必须在 Config 中提供 'teacher_checkpoint_path'！")
+            
+            print(f"Initializing Teacher & Critic from {sf_ckpt}...")
+            
+            # --- Teacher (Real Score) ---
+            # 加载权重并冻结
+            self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
+            self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+            load_weights_to_model(self.real_score, sf_ckpt)
+            self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
-        self.fake_score.model.requires_grad_(True)
+            # --- Critic (Fake Score) ---
+            # 加载权重并开启梯度
+            self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
+            self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+            load_weights_to_model(self.fake_score, sf_ckpt)
+            self.fake_score.model.requires_grad_(True)
+            
+        else:
+            self.real_score = None
+            self.fake_score = None
 
         self.text_encoder = WanTextEncoder()
         self.text_encoder.requires_grad_(False)
@@ -218,5 +283,6 @@ class SelfForcingModel(BaseModel):
             same_step_across_blocks=self.args.same_step_across_blocks,
             last_step_only=self.args.last_step_only,
             num_max_frames=self.num_training_frames,
-            context_noise=self.args.context_noise
+            context_noise=self.args.context_noise,
+            first_block_full_steps=getattr(self.args, "first_block_full_steps", False)
         )

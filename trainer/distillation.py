@@ -1,5 +1,6 @@
 import gc
 import logging
+# from peft import get_peft_model, LoraConfig, TaskType
 
 from utils.dataset import ShardingLMDBDataset, cycle
 from utils.dataset import TextDataset
@@ -15,6 +16,8 @@ import torch
 import wandb
 import time
 import os
+from torch.distributed.fsdp import CPUOffload
+import shutil
 
 
 class Trainer:
@@ -35,6 +38,20 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_wandb = config.disable_wandb
+
+        # Calculate Gradient Accumulation Steps
+        # 自动计算梯度累积步数
+        self.micro_batch_size = config.batch_size * self.world_size
+        self.grad_accum_steps = max(1, config.total_batch_size // self.micro_batch_size)
+        
+        if self.is_main_process:
+            print(f"=== Gradient Accumulation Configuration ===")
+            print(f"Total Batch Size Target: {config.total_batch_size}")
+            print(f"Physical GPUs: {self.world_size}")
+            print(f"Per-GPU Batch Size: {config.batch_size}")
+            print(f"Effective Micro Batch Size: {self.micro_batch_size}")
+            print(f"Calculated Accumulation Steps: {self.grad_accum_steps}")
+            print(f"=========================================")
 
         # use a random seed for the training
         if config.seed == 0:
@@ -57,7 +74,7 @@ class Trainer:
 
         self.output_path = config.logdir
 
-        # Step 2: Initialize the model and optimizer
+        # Step 2: Initialize the model
         if config.distribution_loss == "causvid":
             self.model = CausVid(config, device=self.device)
         elif config.distribution_loss == "dmd":
@@ -67,28 +84,45 @@ class Trainer:
         else:
             raise ValueError("Invalid distribution matching loss")
 
-        # Save pretrained model state_dicts to CPU
-        self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
+        # ======================= 全量微调设置 (移除 LoRA) =======================
+        print("Configuring for Full Fine-tuning...")
+        
+        # Generator: 开启梯度
+        self.model.generator.requires_grad_(True)
+        # Teacher (Real Score): 冻结
+        self.model.real_score.requires_grad_(False)
+        # Critic (Fake Score): 开启梯度
+        self.model.fake_score.requires_grad_(True)
+        
+        if self.is_main_process:
+            gen_params = sum(p.numel() for p in self.model.generator.parameters() if p.requires_grad)
+            critic_params = sum(p.numel() for p in self.model.fake_score.parameters() if p.requires_grad)
+            print(f"Generator Trainable Params: {gen_params / 1e9:.2f} B")
+            print(f"Critic Trainable Params: {critic_params / 1e9:.2f} B")
 
+        # ======================= FSDP 包装 =======================
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.generator_fsdp_wrap_strategy
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            cpu_offload=CPUOffload(offload_params=True)
         )
 
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.real_score_fsdp_wrap_strategy
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            cpu_offload=CPUOffload(offload_params=True)
         )
 
         self.model.fake_score = fsdp_wrap(
             self.model.fake_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
-            wrap_strategy=config.fake_score_fsdp_wrap_strategy
+            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            cpu_offload=CPUOffload(offload_params=True)
         )
 
         self.model.text_encoder = fsdp_wrap(
@@ -96,13 +130,31 @@ class Trainer:
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
-            cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
+            cpu_offload=getattr(config, "text_encoder_cpu_offload", True)
         )
 
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(
                 device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
 
+        # ======================= 检查点加载 =======================
+        if getattr(config, "resume_step", 0) > 0:
+            self.step = config.resume_step
+            print(f"Resuming training from step {self.step}")
+            ckpt_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
+            ckpt_path = os.path.join(ckpt_dir, "model.pt")
+            if os.path.exists(ckpt_path):
+                print(f"Loading full checkpoint state from {ckpt_path}")
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+                
+                if "generator" in state_dict:
+                    self.model.generator.load_state_dict(state_dict["generator"], strict=False)
+                if "critic" in state_dict:
+                    self.model.fake_score.load_state_dict(state_dict["critic"], strict=False)
+            else:
+                print(f"Warning: Resume step is set but checkpoint {ckpt_path} not found.")
+
+        # ======================= 初始化优化器 =======================
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
              if param.requires_grad],
@@ -136,8 +188,7 @@ class Trainer:
             print("DATASET SIZE %d" % len(dataset))
         self.dataloader = cycle(dataloader)
 
-        ##############################################################################################################
-        # 6. Set up EMA parameter containers
+        # 6. Set up EMA
         rename_param = (
             lambda name: name.replace("_fsdp_wrapped_module.", "")
             .replace("_checkpoint_wrapped_module.", "")
@@ -147,31 +198,15 @@ class Trainer:
         for n, p in self.model.generator.named_parameters():
             if not p.requires_grad:
                 continue
-
             renamed_n = rename_param(n)
             self.name_to_trainable_params[renamed_n] = p
+            
         ema_weight = config.ema_weight
         self.generator_ema = None
         if (ema_weight is not None) and (ema_weight > 0.0):
             print(f"Setting up EMA with weight {ema_weight}")
             self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
 
-        ##############################################################################################################
-        # 7. (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
-        if getattr(config, "generator_ckpt", False):
-            print(f"Loading pretrained generator from {config.generator_ckpt}")
-            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
-            if "generator" in state_dict:
-                state_dict = state_dict["generator"]
-            elif "model" in state_dict:
-                state_dict = state_dict["model"]
-            self.model.generator.load_state_dict(
-                state_dict, strict=True
-            )
-
-        ##############################################################################################################
-
-        # Let's delete EMA params for early steps to save some computes at training and inference
         if self.step < config.ema_start_step:
             self.generator_ema = None
 
@@ -181,36 +216,41 @@ class Trainer:
 
     def save(self):
         print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
-        critic_state_dict = fsdp_state_dict(
-            self.model.fake_score)
+        generator_state_dict = fsdp_state_dict(self.model.generator)
+        critic_state_dict = fsdp_state_dict(self.model.fake_score)
 
-        if self.config.ema_start_step < self.step:
-            state_dict = {
-                "generator": generator_state_dict,
-                "critic": critic_state_dict,
-                "generator_ema": self.generator_ema.state_dict(),
-            }
-        else:
-            state_dict = {
-                "generator": generator_state_dict,
-                "critic": critic_state_dict,
-            }
+        state_dict = {
+            "generator": generator_state_dict,
+            "critic": critic_state_dict,
+        }
+        
+        if self.generator_ema is not None:
+             state_dict["generator_ema"] = self.generator_ema.state_dict()
 
         if self.is_main_process:
-            os.makedirs(os.path.join(self.output_path,
-                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
-            torch.save(state_dict, os.path.join(self.output_path,
-                       f"checkpoint_model_{self.step:06d}", "model.pt"))
-            print("Model saved to", os.path.join(self.output_path,
-                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+            current_checkpoint_dir = os.path.join(self.output_path, f"checkpoint_model_{self.step:06d}")
+            os.makedirs(current_checkpoint_dir, exist_ok=True)
+            torch.save(state_dict, os.path.join(current_checkpoint_dir, "model.pt"))
+            print("Model saved to", os.path.join(current_checkpoint_dir, "model.pt"))
+            
+            # 清理旧检查点
+            all_checkpoints = [d for d in os.listdir(self.output_path) if d.startswith('checkpoint_model_')]
+            all_checkpoints.sort(key=lambda x: int(x.split('_')[-1]))
+            
+            checkpoints_to_keep = 2 
+            if len(all_checkpoints) > checkpoints_to_keep:
+                checkpoints_to_delete = all_checkpoints[:-checkpoints_to_keep]
+                for ckpt_dir in checkpoints_to_delete:
+                    full_path = os.path.join(self.output_path, ckpt_dir)
+                    print(f"Removing old checkpoint: {full_path}")
+                    shutil.rmtree(full_path)
 
-    def fwdbwd_one_step(self, batch, train_generator):
+    def fwdbwd_one_step(self, batch, train_generator, accum_steps=1):
+        """
+        Modified forward/backward step to support gradient accumulation.
+        NOTE: This function now performs LOSS SCALING but does NOT clip gradients here.
+        """
         self.model.eval()  # prevent any randomness (e.g. dropout)
-
-        if self.step % 20 == 0:
-            torch.cuda.empty_cache()
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
@@ -240,7 +280,7 @@ class Trainer:
             else:
                 unconditional_dict = self.unconditional_dict
 
-        # Step 3: Store gradients for the generator (if training the generator)
+        # Step 3: Train Generator
         if train_generator:
             generator_loss, generator_log_dict = self.model.generator_loss(
                 image_or_video_shape=image_or_video_shape,
@@ -249,19 +289,18 @@ class Trainer:
                 clean_latent=clean_latent,
                 initial_latent=image_latent if self.config.i2v else None
             )
+            
+            # Scale Loss for Accumulation
+            scaled_loss = generator_loss / accum_steps
+            scaled_loss.backward()
 
-            generator_loss.backward()
-            generator_grad_norm = self.model.generator.clip_grad_norm_(
-                self.max_grad_norm_generator)
-
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": generator_grad_norm})
-
+            # We return the RAW loss for logging, but the gradients are already scaled and backwarded
+            generator_log_dict.update({"generator_loss": generator_loss})
             return generator_log_dict
         else:
             generator_log_dict = {}
 
-        # Step 4: Store gradients for the critic (if training the critic)
+        # Step 4: Train Critic
         critic_loss, critic_log_dict = self.model.critic_loss(
             image_or_video_shape=image_or_video_shape,
             conditional_dict=conditional_dict,
@@ -270,21 +309,17 @@ class Trainer:
             initial_latent=image_latent if self.config.i2v else None
         )
 
-        critic_loss.backward()
-        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
-            self.max_grad_norm_critic)
+        # Scale Loss for Accumulation
+        scaled_critic_loss = critic_loss / accum_steps
+        scaled_critic_loss.backward()
 
-        critic_log_dict.update({"critic_loss": critic_loss,
-                                "critic_grad_norm": critic_grad_norm})
-
+        critic_log_dict.update({"critic_loss": critic_loss})
         return critic_log_dict
 
     def generate_video(self, pipeline, prompts, image=None):
         batch_size = len(prompts)
         if image is not None:
             image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device="cuda", dtype=torch.bfloat16)
-
-            # Encode the input image as the first latent
             initial_latent = pipeline.vae.encode_to_latent(image).to(device="cuda", dtype=torch.bfloat16)
             initial_latent = initial_latent.repeat(batch_size, 1, 1, 1, 1)
             sampled_noise = torch.randn(
@@ -312,65 +347,91 @@ class Trainer:
     def train(self):
         start_step = self.step
 
-        while True:
+        while self.step < self.config.max_steps:
+            if self.step % 20 == 0:
+                torch.cuda.empty_cache()
+
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
 
-            # Train the generator
+            # =================== Train Generator ===================
             if TRAIN_GENERATOR:
                 self.generator_optimizer.zero_grad(set_to_none=True)
                 extras_list = []
-                batch = next(self.dataloader)
-                extra = self.fwdbwd_one_step(batch, True)
-                extras_list.append(extra)
-                generator_log_dict = merge_dict_list(extras_list)
+                
+                # Gradient Accumulation Loop
+                for _ in range(self.grad_accum_steps):
+                    batch = next(self.dataloader)
+                    extra = self.fwdbwd_one_step(batch, True, accum_steps=self.grad_accum_steps)
+                    extras_list.append(extra)
+                
+                # Clip Gradients AFTER accumulation
+                generator_grad_norm = self.model.generator.clip_grad_norm_(
+                    self.max_grad_norm_generator)
+                
                 self.generator_optimizer.step()
                 if self.generator_ema is not None:
                     self.generator_ema.update(self.model.generator)
+                    
+                generator_log_dict = merge_dict_list(extras_list)
+                # Manually add grad norm to log dict for logging consistency
+                generator_log_dict["generator_grad_norm"] = generator_grad_norm
 
-            # Train the critic
+            # =================== Train Critic ===================
             self.critic_optimizer.zero_grad(set_to_none=True)
             extras_list = []
-            batch = next(self.dataloader)
-            extra = self.fwdbwd_one_step(batch, False)
-            extras_list.append(extra)
-            critic_log_dict = merge_dict_list(extras_list)
-            self.critic_optimizer.step()
+            
+            # Gradient Accumulation Loop
+            for _ in range(self.grad_accum_steps):
+                batch = next(self.dataloader)
+                extra = self.fwdbwd_one_step(batch, False, accum_steps=self.grad_accum_steps)
+                extras_list.append(extra)
 
-            # Increment the step since we finished gradient update
+            # Clip Gradients AFTER accumulation
+            critic_grad_norm = self.model.fake_score.clip_grad_norm_(
+                self.max_grad_norm_critic)
+            
+            self.critic_optimizer.step()
+            
+            critic_log_dict = merge_dict_list(extras_list)
+            critic_log_dict["critic_grad_norm"] = critic_grad_norm
+
+            # =================== Logging & Housekeeping ===================
             self.step += 1
 
-            # Create EMA params (if not already created)
             if (self.step >= self.config.ema_start_step) and \
                     (self.generator_ema is None) and (self.config.ema_weight > 0):
                 self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
 
-            # Save the model
             if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
                 torch.cuda.empty_cache()
                 self.save()
                 torch.cuda.empty_cache()
 
-            # Logging
             if self.is_main_process:
                 wandb_loss_dict = {}
                 if TRAIN_GENERATOR:
                     wandb_loss_dict.update(
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
+                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].item(), # it's already a scalar from clip_grad_norm_
+                            "dmdtrain_gradient_norm": generator_log_dict.get("dmdtrain_gradient_norm", torch.tensor(0.0)).mean().item()
                         }
                     )
 
                 wandb_loss_dict.update(
                     {
                         "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].item()
                     }
                 )
 
                 if not self.disable_wandb:
                     wandb.log(wandb_loss_dict, step=self.step)
+                else:
+                    log_str = f"Step: {self.step}"
+                    for key, value in wandb_loss_dict.items():
+                        log_str += f", {key}: {value:.6f}"
+                    print(log_str)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
