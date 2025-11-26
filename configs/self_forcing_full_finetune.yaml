@@ -1,9 +1,9 @@
 # configs/self_forcing_full_finetune.yaml
 
 # ================= 路径配置 =================
-# 【重要】确保这是绝对路径，用于 base.py 加载初始权重
-teacher_checkpoint_path: /data/datasets/guiyuwei/zhoumingyue/projects/Self-Forcing/checkpoints/self_forcing_dmd.pt
-# 原始配置中用于 resume 的字段，这里设为 null 或注释掉，因为我们用 teacher_checkpoint_path 初始化
+
+teacher_checkpoint_path: checkpoints/self_forcing_dmd.pt
+
 # generator_ckpt: ... 
 
 # ================= 训练模式 =================
@@ -11,7 +11,7 @@ trainer: score_distillation
 distribution_loss: dmd
 mixed_precision: true
 gradient_checkpointing: true
-# 【补回】显存分片策略
+
 sharding_strategy: hybrid_full
 
 # ================= 模型配置 =================
@@ -25,9 +25,9 @@ text_encoder_fsdp_wrap_strategy: size
 
 # ================= 损失与指导 =================
 denoising_loss_type: flow
-# 【关键修复】指导比例，缺了这个会报错
+
 guidance_scale: 3.0 
-# (可选显式指定)
+
 # real_guidance_scale: 3.0
 # fake_guidance_scale: 0.0
 
@@ -49,7 +49,7 @@ model_kwargs:
 seed: 0
 lr: 2.0e-06
 lr_critic: 4.0e-07
-# 【补回】
+
 discriminator_lr_multiplier: 1.0 
 beta1: 0.0
 beta2: 0.999
