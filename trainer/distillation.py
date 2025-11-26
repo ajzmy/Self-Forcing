@@ -237,7 +237,7 @@ class Trainer:
             all_checkpoints = [d for d in os.listdir(self.output_path) if d.startswith('checkpoint_model_')]
             all_checkpoints.sort(key=lambda x: int(x.split('_')[-1]))
             
-            checkpoints_to_keep = 2 
+            checkpoints_to_keep = 10 
             if len(all_checkpoints) > checkpoints_to_keep:
                 checkpoints_to_delete = all_checkpoints[:-checkpoints_to_keep]
                 for ckpt_dir in checkpoints_to_delete:
